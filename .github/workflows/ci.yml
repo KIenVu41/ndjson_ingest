@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dart:
+    name: Dart SDK (${{ matrix.sdk }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ['3.10.0', '3.13.4']
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ matrix.sdk }}
+
+      - run: dart pub get
+
+      - name: Check formatting
+        if: matrix.sdk == '3.13.4'
+        run: dart format --output=none --set-exit-if-changed lib test tool example
+
+      - run: dart analyze
+      - run: dart test --reporter expanded
+
+      - name: Run the resume example
+        if: matrix.sdk == '3.13.4'
+        run: dart run example/ndjson_ingest_example.dart

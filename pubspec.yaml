@@ -1,0 +1,16 @@
+name: ndjson_ingest
+description: A Dart package for importing local NDJSON files into SQLite with resumable batches.
+version: 0.1.0-dev.1
+repository: https://github.com/KIenVu41/ndjson_ingest
+issue_tracker: https://github.com/KIenVu41/ndjson_ingest/issues
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  crypto: ^3.0.8
+  sqlite3: ^3.9.1
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.26.3
