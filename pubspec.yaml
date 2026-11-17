@@ -3,7 +3,6 @@ description: A Dart package for importing local NDJSON files into SQLite with re
 version: 0.1.0-dev.1
 repository: https://github.com/KIenVu41/ndjson_ingest
 issue_tracker: https://github.com/KIenVu41/ndjson_ingest/issues
-publish_to: none
 
 environment:
   sdk: ^3.10.0

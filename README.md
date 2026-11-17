@@ -8,7 +8,7 @@ after the process stops.
 
 Use Dart 3.13.4, available via the pinned Flutter 3.47.5 SDK in FVM.
 The minimum is Dart 3.10.0. The native SQLite build and import tests have been
-verified on macOS arm64.
+verified on macOS arm64 and Ubuntu. The importer uses native Dart I/O.
 
 ```sh
 fvm dart pub get
@@ -40,7 +40,8 @@ SHA-256 hash of the source before it resumes.
 Every line needs an LF or CRLF ending. The prototype rejects blank lines and
 limits a line to 256 KiB and a batch to 500 rows or 4 MiB of source bytes,
 whichever comes first. A single worker isolate commits rows and the checkpoint
-in one transaction. Duplicate IDs cause the current batch to roll back.
+in one transaction. Duplicate IDs or an interrupted transaction roll back the
+current batch. Earlier committed batches remain available.
 
 ## Import into your own table
 

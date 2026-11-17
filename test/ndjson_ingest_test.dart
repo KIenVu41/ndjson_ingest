@@ -85,6 +85,73 @@ void main() {
         const query = 'SELECT * FROM inventory ORDER BY item_id';
         expect(_read(target, query), _read(uninterrupted, query));
         expect(await ingest(), result);
+
+        final interrupted = '${directory.path}/interrupted.sqlite';
+        _createInventory(interrupted);
+        final firstBatch = await ingest(database: interrupted, maxBatches: 1);
+        final committedRows = _read(interrupted, query);
+        expect(committedRows, hasLength(500));
+        final database = sqlite3.open(interrupted);
+        try {
+          database.execute('PRAGMA journal_mode = DELETE');
+          // The preceding INSERT modifies a page. This trigger holds the
+          // transaction open on the next row while the parent observes its journal.
+          database.execute('''
+          CREATE TRIGGER hold_second_row BEFORE INSERT ON inventory
+          WHEN NEW.item_id = 'sku-501'
+          BEGIN
+            SELECT sum(length(randomblob(1024))) FROM (
+              WITH RECURSIVE work(n) AS (
+                VALUES(1) UNION ALL SELECT n + 1 FROM work WHERE n < 100000000
+              )
+              SELECT n FROM work
+            );
+          END
+        ''');
+        } finally {
+          database.close();
+        }
+        final pending = await Process.start('$build/bundle/bin/import_worker', [
+          source.path,
+          interrupted,
+        ]);
+        final pendingOutput = pending.stdout.drain<void>();
+        final pendingErrors = pending.stderr.drain<void>();
+        try {
+          final deadline = Stopwatch()..start();
+          final journal = File('$interrupted-journal');
+          while (!journal.existsSync() || journal.lengthSync() <= 512) {
+            if (deadline.elapsed > const Duration(seconds: 15)) {
+              fail('The importer did not open a write transaction.');
+            }
+            await Future<void>.delayed(const Duration(milliseconds: 10));
+          }
+          expect(pending.kill(ProcessSignal.sigkill), isTrue);
+          expect(await pending.exitCode, isNot(0));
+          expect(_read(interrupted, query), committedRows);
+          expect(
+            _read(interrupted, '''
+          SELECT next_offset, rows_committed FROM ndjson_import_jobs
+        '''),
+            [
+              {'next_offset': firstBatch.offset, 'rows_committed': 500},
+            ],
+          );
+          final recovered = sqlite3.open(interrupted);
+          try {
+            recovered.execute('DROP TRIGGER hold_second_row');
+          } finally {
+            recovered.close();
+          }
+          expect(await ingest(database: interrupted), result);
+          expect(_read(interrupted, query), _read(uninterrupted, query));
+        } finally {
+          pending.kill();
+          await pending.stdin.close();
+          await pending.exitCode;
+          await pendingOutput;
+          await pendingErrors;
+        }
       } finally {
         child.kill();
         await child.stdin.close();
