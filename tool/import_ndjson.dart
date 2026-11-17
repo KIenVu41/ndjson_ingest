@@ -52,6 +52,9 @@ Future<void> main(List<String> args) async {
         'complete': progress.complete,
       }),
     );
+  } on NdjsonImportException catch (error) {
+    stderr.writeln(error);
+    exitCode = 1;
   } on SqliteException catch (error) {
     stderr.writeln('SQLite import failed (code ${error.extendedResultCode}).');
     exitCode = 1;

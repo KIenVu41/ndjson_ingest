@@ -74,6 +74,11 @@ change alters what the same mapping means. An incompatible job requires a
 new job ID. Existing rows remain in the destination, so the application
 must decide how to handle them before importing again.
 
+SQLite and file I/O failures surface as `NdjsonImportException`. The error
+provides a SQLite result code or OS error code when available. A rejected row
+also provides its source line and byte offset. The exception omits SQL, bound
+values, file paths, and the original database or OS error message.
+
 Run the recovery and concurrency tests with `fvm dart test`.
 
 The [runnable example](example/ndjson_ingest_example.dart) creates a temporary

@@ -33,6 +33,68 @@ void main() {
     maxBatches: maxBatches,
   );
 
+  test('redacts SQLite errors and retains the rejected row position', () async {
+    const payload = 'SYNTHETIC_PRIVATE_ROW_VALUE';
+    const sqliteMessage = 'SYNTHETIC_PRIVATE_SQLITE_MESSAGE';
+    _writeSource(source, 503);
+    source.writeAsStringSync(
+      source.readAsStringSync().replaceFirst('Cà phê 501', payload),
+    );
+    final bytes = source.readAsBytesSync();
+    var rejectedOffset = 0;
+    for (var line = 0; line < 501; line++) {
+      rejectedOffset = bytes.indexOf(0x0a, rejectedOffset) + 1;
+    }
+    await ingest(maxBatches: 1);
+
+    final database = sqlite3.open(target);
+    try {
+      database.execute('''
+        CREATE TRIGGER reject_row BEFORE INSERT ON inventory
+        WHEN NEW.item_id = 'sku-501'
+        BEGIN SELECT RAISE(ABORT, '$sqliteMessage'); END
+      ''');
+    } finally {
+      database.close();
+    }
+
+    await expectLater(
+      ingest(),
+      throwsA(
+        isA<NdjsonImportException>()
+            .having((error) => error.sqliteCode, 'SQLite extended code', 1811)
+            .having((error) => error.line, 'source line', 502)
+            .having((error) => error.byteOffset, 'byte offset', rejectedOffset)
+            .having(
+              (error) => error.toString(),
+              'public message',
+              'SQLite import failed (code 1811) at line 502, byte $rejectedOffset.',
+            ),
+      ),
+    );
+    expect(_read(target, 'SELECT count(*) AS count FROM inventory'), [
+      {'count': 500},
+    ]);
+    expect(_read(target, 'SELECT rows_committed FROM ndjson_import_jobs'), [
+      {'rows_committed': 500},
+    ]);
+  });
+
+  test('redacts the source path from public I/O errors', () async {
+    await expectLater(
+      ingest(),
+      throwsA(
+        isA<NdjsonImportException>()
+            .having((error) => error.osErrorCode, 'OS code', isNotNull)
+            .having(
+              (error) => error.toString(),
+              'public message',
+              'Import file operation failed.',
+            ),
+      ),
+    );
+  });
+
   test(
     'resumes a killed process on a caller-owned schema',
     () async {

@@ -13,7 +13,41 @@ const _batchRows = 500;
 /// The cumulative progress stored for an import job.
 typedef ImportProgress = ({int rows, int offset, bool complete});
 
-typedef _Line = ({List<Object?> values, int nextOffset});
+typedef _Line = ({List<Object?> values, int offset, int nextOffset});
+
+/// A SQLite or I/O failure with details safe to expose to application logs.
+///
+/// The original exception, SQL, bound values, and file paths are omitted.
+final class NdjsonImportException implements Exception {
+  const NdjsonImportException._({
+    this.sqliteCode,
+    this.osErrorCode,
+    this.line,
+    this.byteOffset,
+  });
+
+  /// SQLite's extended result code, when the failure came from SQLite.
+  final int? sqliteCode;
+
+  /// The operating-system error code, when available for an I/O failure.
+  final int? osErrorCode;
+
+  /// The one-based source line, when SQLite rejected a specific row.
+  final int? line;
+
+  /// The zero-based byte offset of [line], when available.
+  final int? byteOffset;
+
+  @override
+  String toString() {
+    final code = sqliteCode;
+    final message = code == null
+        ? 'Import file operation failed'
+        : 'SQLite import failed (code $code)';
+    final position = line == null ? '' : ' at line $line, byte $byteOffset';
+    return '$message$position.';
+  }
+}
 
 /// Imports an immutable local NDJSON file into an existing SQLite table.
 ///
@@ -24,6 +58,8 @@ typedef _Line = ({List<Object?> values, int nextOffset});
 /// Use the same [jobId] and configuration to resume. Change [mappingVersion]
 /// when the target schema changes the meaning of imported data. [maxBatches]
 /// can pause the import at a committed boundary. The result is cumulative.
+///
+/// SQLite and file I/O failures are reported as [NdjsonImportException].
 Future<ImportProgress> importNdjson({
   required String sourcePath,
   required String databasePath,
@@ -53,17 +89,23 @@ Future<ImportProgress> importNdjson({
   if (tableName == 'ndjson_import_jobs' || tableName.startsWith('sqlite_')) {
     throw ArgumentError('The destination table name is reserved.');
   }
-  return Isolate.run(
-    () => _import(
-      sourcePath,
-      databasePath,
-      jobId,
-      table,
-      mapping,
-      mappingVersion,
-      maxBatches,
-    ),
-  );
+  return Isolate.run(() async {
+    try {
+      return await _import(
+        sourcePath,
+        databasePath,
+        jobId,
+        table,
+        mapping,
+        mappingVersion,
+        maxBatches,
+      );
+    } on SqliteException catch (error) {
+      throw NdjsonImportException._(sqliteCode: error.extendedResultCode);
+    } on FileSystemException catch (error) {
+      throw NdjsonImportException._(osErrorCode: error.osError?.errorCode);
+    }
+  });
 }
 
 String _identifier(String name) {
@@ -132,7 +174,7 @@ Future<ImportProgress> _import(
 
       var batches = 0;
       var pendingOffset = offset;
-      final batch = <List<Object?>>[];
+      final batch = <_Line>[];
 
       void commit() {
         database.execute('BEGIN IMMEDIATE');
@@ -145,8 +187,17 @@ Future<ImportProgress> _import(
               current['mapping_sha256'] != mappingDigest) {
             throw StateError('Another worker changed the import checkpoint.');
           }
-          for (final values in batch) {
-            insert.execute(values);
+          for (var index = 0; index < batch.length; index++) {
+            final row = batch[index];
+            try {
+              insert.execute(row.values);
+            } on SqliteException catch (error) {
+              throw NdjsonImportException._(
+                sqliteCode: error.extendedResultCode,
+                line: rows + index + 1,
+                byteOffset: row.offset,
+              );
+            }
           }
           database.execute(
             '''
@@ -177,7 +228,7 @@ Future<ImportProgress> _import(
           commit();
           if (batches == maxBatches) break;
         }
-        batch.add(line.values);
+        batch.add(line);
         pendingOffset = line.nextOffset;
         if (batch.length == _batchRows) {
           commit();
@@ -258,6 +309,7 @@ Stream<_Line> _readLines(
       final nextOffset = lineStart + line.length + 1;
       yield (
         values: _decodeRow(line.takeBytes(), lineNumber, lineStart, keys),
+        offset: lineStart,
         nextOffset: nextOffset,
       );
       lineStart = nextOffset;
