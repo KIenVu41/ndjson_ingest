@@ -15,16 +15,33 @@ typedef ImportProgress = ({int rows, int offset, bool complete});
 
 typedef _Line = ({List<Object?> values, int offset, int nextOffset});
 
-/// A SQLite or I/O failure with details safe to expose to application logs.
+/// Stable categories for sanitized import failures.
+enum NdjsonImportErrorCode {
+  sqlite,
+  io,
+  invalidJson,
+  expectedObject,
+  missingMappedKey,
+  unsupportedValue,
+  lineTooLong,
+  missingLineEnding,
+  rowExceedsBatchLimit,
+}
+
+/// An import failure with details safe to expose to application logs.
 ///
 /// The original exception, SQL, bound values, and file paths are omitted.
 final class NdjsonImportException implements Exception {
   const NdjsonImportException._({
+    required this.code,
     this.sqliteCode,
     this.osErrorCode,
     this.line,
     this.byteOffset,
   });
+
+  /// The machine-readable failure category.
+  final NdjsonImportErrorCode code;
 
   /// SQLite's extended result code, when the failure came from SQLite.
   final int? sqliteCode;
@@ -32,7 +49,7 @@ final class NdjsonImportException implements Exception {
   /// The operating-system error code, when available for an I/O failure.
   final int? osErrorCode;
 
-  /// The one-based source line, when SQLite rejected a specific row.
+  /// The one-based source line, when a specific row was rejected.
   final int? line;
 
   /// The zero-based byte offset of [line], when available.
@@ -40,10 +57,11 @@ final class NdjsonImportException implements Exception {
 
   @override
   String toString() {
-    final code = sqliteCode;
-    final message = code == null
-        ? 'Import file operation failed'
-        : 'SQLite import failed (code $code)';
+    final message = switch (code) {
+      NdjsonImportErrorCode.sqlite => 'SQLite import failed (code $sqliteCode)',
+      NdjsonImportErrorCode.io => 'Import file operation failed',
+      _ => 'NDJSON import failed (${code.name})',
+    };
     final position = line == null ? '' : ' at line $line, byte $byteOffset';
     return '$message$position.';
   }
@@ -59,7 +77,12 @@ final class NdjsonImportException implements Exception {
 /// when the target schema changes the meaning of imported data. [maxBatches]
 /// can pause the import at a committed boundary. The result is cumulative.
 ///
-/// SQLite and file I/O failures are reported as [NdjsonImportException].
+/// [batchRows] and [maxBatchBytes] bound each transaction. Batch bytes include
+/// line endings. A single row exceeding the batch limit is rejected.
+/// [maxLineBytes] counts bytes before LF, including CR for CRLF.
+/// These limits may change when resuming without changing the mapping.
+///
+/// NDJSON, SQLite and file I/O failures are reported as [NdjsonImportException].
 Future<ImportProgress> importNdjson({
   required String sourcePath,
   required String databasePath,
@@ -68,7 +91,13 @@ Future<ImportProgress> importNdjson({
   required Map<String, String> columns,
   String mappingVersion = '1',
   int? maxBatches,
+  int batchRows = _batchRows,
+  int maxBatchBytes = _maxBatchBytes,
+  int maxLineBytes = _maxLineBytes,
 }) {
+  if (batchRows < 1 || maxBatchBytes < 1 || maxLineBytes < 1) {
+    throw ArgumentError('Batch and line limits must be positive.');
+  }
   if (jobId.trim().isEmpty) throw ArgumentError('jobId must not be blank.');
   if (maxBatches != null && maxBatches < 1) {
     throw ArgumentError('maxBatches must be positive.');
@@ -99,11 +128,20 @@ Future<ImportProgress> importNdjson({
         mapping,
         mappingVersion,
         maxBatches,
+        batchRows,
+        maxBatchBytes,
+        maxLineBytes,
       );
     } on SqliteException catch (error) {
-      throw NdjsonImportException._(sqliteCode: error.extendedResultCode);
+      throw NdjsonImportException._(
+        code: NdjsonImportErrorCode.sqlite,
+        sqliteCode: error.extendedResultCode,
+      );
     } on FileSystemException catch (error) {
-      throw NdjsonImportException._(osErrorCode: error.osError?.errorCode);
+      throw NdjsonImportException._(
+        code: NdjsonImportErrorCode.io,
+        osErrorCode: error.osError?.errorCode,
+      );
     }
   });
 }
@@ -139,6 +177,9 @@ Future<ImportProgress> _import(
   Map<String, String> columns,
   String mappingVersion,
   int? maxBatches,
+  int batchRows,
+  int maxBatchBytes,
+  int maxLineBytes,
 ) async {
   final file = File(sourcePath);
   final size = await file.length();
@@ -193,6 +234,7 @@ Future<ImportProgress> _import(
               insert.execute(row.values);
             } on SqliteException catch (error) {
               throw NdjsonImportException._(
+                code: NdjsonImportErrorCode.sqlite,
                 sqliteCode: error.extendedResultCode,
                 line: rows + index + 1,
                 byteOffset: row.offset,
@@ -223,14 +265,22 @@ Future<ImportProgress> _import(
         offset,
         rows + 1,
         columns.keys,
+        maxLineBytes,
       )) {
-        if (batch.isNotEmpty && line.nextOffset - offset > _maxBatchBytes) {
+        if (line.nextOffset - line.offset > maxBatchBytes) {
+          throw NdjsonImportException._(
+            code: NdjsonImportErrorCode.rowExceedsBatchLimit,
+            line: rows + batch.length + 1,
+            byteOffset: line.offset,
+          );
+        }
+        if (batch.isNotEmpty && line.nextOffset - offset > maxBatchBytes) {
           commit();
           if (batches == maxBatches) break;
         }
         batch.add(line);
         pendingOffset = line.nextOffset;
-        if (batch.length == _batchRows) {
+        if (batch.length == batchRows) {
           commit();
           if (batches == maxBatches) break;
         }
@@ -298,6 +348,7 @@ Stream<_Line> _readLines(
   int offset,
   int lineNumber,
   Iterable<String> keys,
+  int maxLineBytes,
 ) async* {
   final line = BytesBuilder(copy: false);
   var lineStart = offset;
@@ -305,7 +356,7 @@ Stream<_Line> _readLines(
     var start = 0;
     for (var end = 0; end < chunk.length; end++) {
       if (chunk[end] != 0x0a) continue;
-      _append(line, chunk, start, end, lineNumber, lineStart);
+      _append(line, chunk, start, end, lineNumber, lineStart, maxLineBytes);
       final nextOffset = lineStart + line.length + 1;
       yield (
         values: _decodeRow(line.takeBytes(), lineNumber, lineStart, keys),
@@ -316,11 +367,21 @@ Stream<_Line> _readLines(
       lineNumber++;
       start = end + 1;
     }
-    _append(line, chunk, start, chunk.length, lineNumber, lineStart);
+    _append(
+      line,
+      chunk,
+      start,
+      chunk.length,
+      lineNumber,
+      lineStart,
+      maxLineBytes,
+    );
   }
   if (line.isNotEmpty) {
-    throw FormatException(
-      'Missing line ending at line $lineNumber, byte $lineStart.',
+    throw NdjsonImportException._(
+      code: NdjsonImportErrorCode.missingLineEnding,
+      line: lineNumber,
+      byteOffset: lineStart,
     );
   }
 }
@@ -332,10 +393,13 @@ void _append(
   int end,
   int lineNumber,
   int offset,
+  int maxLineBytes,
 ) {
-  if (line.length + end - start > _maxLineBytes) {
-    throw FormatException(
-      'Line $lineNumber exceeds the byte limit at byte $offset.',
+  if (line.length + end - start > maxLineBytes) {
+    throw NdjsonImportException._(
+      code: NdjsonImportErrorCode.lineTooLong,
+      line: lineNumber,
+      byteOffset: offset,
     );
   }
   if (start < end) line.add(chunk.sublist(start, end));
@@ -355,26 +419,36 @@ List<Object?> _decodeRow(
     if (content.contains(0x0d)) throw const FormatException();
     value = jsonDecode(utf8.decode(content));
   } on FormatException {
-    throw FormatException('Invalid NDJSON at line $lineNumber, byte $offset.');
+    throw NdjsonImportException._(
+      code: NdjsonImportErrorCode.invalidJson,
+      line: lineNumber,
+      byteOffset: offset,
+    );
   }
   if (value is! Map<String, dynamic>) {
-    throw FormatException(
-      'Expected a JSON object at line $lineNumber, byte $offset.',
+    throw NdjsonImportException._(
+      code: NdjsonImportErrorCode.expectedObject,
+      line: lineNumber,
+      byteOffset: offset,
     );
   }
   final values = <Object?>[];
   for (final key in keys) {
     if (!value.containsKey(key)) {
-      throw FormatException(
-        'Missing a mapped key at line $lineNumber, byte $offset.',
+      throw NdjsonImportException._(
+        code: NdjsonImportErrorCode.missingMappedKey,
+        line: lineNumber,
+        byteOffset: offset,
       );
     }
     final field = value[key];
     values.add(switch (field) {
       bool flag => flag ? 1 : 0,
       String() || num() || null => field,
-      _ => throw FormatException(
-        'Expected a scalar value at line $lineNumber, byte $offset.',
+      _ => throw NdjsonImportException._(
+        code: NdjsonImportErrorCode.unsupportedValue,
+        line: lineNumber,
+        byteOffset: offset,
       ),
     });
   }
