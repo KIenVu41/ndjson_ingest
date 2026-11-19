@@ -1,8 +1,8 @@
 # ndjson_ingest
 
-A Dart VM project for importing local NDJSON files into SQLite. The first
-milestone is a CLI prototype that can resume from the last committed batch
-after the process stops.
+Import local NDJSON files into SQLite in a worker isolate, with bounded
+batches and atomic checkpoints for resuming after the process stops.
+This package is an early prerelease for native Dart and Flutter applications.
 
 ## Development
 
@@ -35,7 +35,8 @@ The optional fourth argument limits how many batches to commit in one run.
 Run the command again with the same job ID and file to resume. The CLI prints
 the cumulative committed row count, next byte offset, and whether the job
 reached the end. Keep the source immutable during import. Each run streams a
-SHA-256 hash of the source before it resumes.
+SHA-256 hash of the entire source before it resumes. This uses bounded memory
+but requires an O(file size) read even when the checkpoint is near the end.
 
 Every line needs an LF or CRLF ending. The prototype rejects blank lines and
 limits a line to 256 KiB and a batch to 500 rows or 4 MiB of source bytes,
@@ -59,6 +60,9 @@ Future<void> main() async {
     jobId: 'inventory-v1',
     table: 'inventory',
     columns: const {'sku': 'item_id', 'title': 'label', 'active': 'enabled'},
+    batchRows: 500,
+    maxBatchBytes: 4 * 1024 * 1024,
+    maxLineBytes: 256 * 1024,
   );
   print(progress.rows);
 }
@@ -74,7 +78,14 @@ change alters what the same mapping means. An incompatible job requires a
 new job ID. Existing rows remain in the destination, so the application
 must decide how to handle them before importing again.
 
-SQLite and file I/O failures surface as `NdjsonImportException`. The error
+All three limits must be positive. `maxLineBytes` counts the UTF-8 bytes before
+LF, including CR for CRLF. `maxBatchBytes` includes line endings and limits
+source bytes, not decoded object memory or SQLite's total memory usage. A
+single row larger than this limit fails with `rowExceedsBatchLimit`. You may
+change these limits when resuming. An error discards the pending batch while
+preserving previously committed batches and their checkpoint.
+
+NDJSON, SQLite and file I/O failures surface as `NdjsonImportException`. The error
 provides a SQLite result code or OS error code when available. A rejected row
 also provides its source line and byte offset. The exception omits SQL, bound
 values, file paths, and the original database or OS error message.
@@ -84,3 +95,35 @@ Run the recovery and concurrency tests with `fvm dart test`.
 The [runnable example](example/ndjson_ingest_example.dart) creates a temporary
 inventory database, pauses after one batch, resumes the same job, and cleans
 up its files. Run it with `fvm dart run example/ndjson_ingest_example.dart`.
+
+Use `error.code` to handle failures without parsing error messages. NDJSON
+validation errors now use `NdjsonImportException` rather than `FormatException`.
+
+```dart
+try {
+  // await importNdjson(...);
+} on NdjsonImportException catch (error) {
+  print('${error.code.name}: line ${error.line}, byte ${error.byteOffset}');
+}
+```
+
+| Code | Meaning |
+| --- | --- |
+| `invalidJson` | Invalid UTF-8, JSON, blank line, or embedded raw CR |
+| `expectedObject` | JSON root is not an object |
+| `missingMappedKey` | A configured JSON key is absent |
+| `unsupportedValue` | A mapped value is an object or array |
+| `lineTooLong` | Bytes before LF exceed `maxLineBytes` |
+| `missingLineEnding` | The final nonempty line lacks LF |
+| `rowExceedsBatchLimit` | One record including LF exceeds `maxBatchBytes` |
+| `sqlite` / `io` | Database or filesystem failure |
+
+Positions refer to the start of the rejected source line. Not every database
+or I/O failure can be associated with a row. Argument errors and source,
+mapping, or concurrent checkpoint conflicts remain `ArgumentError` and
+`StateError`. Keep the source immutable throughout hashing and import.
+
+Run `fvm dart run tool/benchmark.dart` for a local synthetic benchmark. It
+includes source hashing and database writes, prints process peak RSS, and
+removes its temporary source and databases even on failure. Results depend
+on storage, SQLite settings, data shape, and runtime warm-up.
