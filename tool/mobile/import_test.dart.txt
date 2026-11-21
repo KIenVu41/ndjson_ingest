@@ -1,0 +1,120 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:integration_test/integration_test.dart';
+import 'package:ndjson_ingest/ndjson_ingest.dart';
+import 'package:sqlite3/sqlite3.dart';
+
+void main() {
+  IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+
+  testWidgets('native SQLite import resumes and preserves committed rows', (
+    _,
+  ) async {
+    final directory = await Directory.systemTemp.createTemp(
+      'ndjson-mobile-data-',
+    );
+    try {
+      final source = File('${directory.path}/source.ndjson');
+      final target = '${directory.path}/inventory.sqlite';
+      await source.writeAsString(
+        [
+          for (var id = 0; id < 501; id++)
+            '${jsonEncode({'id': id, 'name': 'Cà phê $id'})}${id.isEven ? '\n' : '\r\n'}',
+        ].join(),
+      );
+      final database = sqlite3.open(target);
+      try {
+        database.execute(
+          'CREATE TABLE inventory (id INTEGER PRIMARY KEY, name TEXT NOT NULL)',
+        );
+      } finally {
+        database.close();
+      }
+
+      Future<ImportProgress> run({int? maxBatches}) => importNdjson(
+        sourcePath: source.path,
+        databasePath: target,
+        jobId: 'mobile',
+        table: 'inventory',
+        columns: const {'id': 'id', 'name': 'name'},
+        maxBatches: maxBatches,
+      );
+      expect((await run(maxBatches: 1)).rows, 500);
+      final complete = await run();
+      expect(complete, (
+        rows: 501,
+        offset: await source.length(),
+        complete: true,
+      ));
+      expect(await run(), complete);
+      final verify = sqlite3.open(target);
+      try {
+        final rows = verify.select(
+          'SELECT id, name FROM inventory ORDER BY id',
+        );
+        expect(rows.length, 501);
+        for (var id = 0; id < rows.length; id++) {
+          expect(rows[id]['id'], id);
+          expect(rows[id]['name'], 'Cà phê $id');
+        }
+      } finally {
+        verify.close();
+      }
+
+      const valid = '{"id":1,"name":"valid"}\n';
+      const privateValue = 'SYNTHETIC_PRIVATE_MOBILE_VALUE';
+      final invalid = File('${directory.path}/invalid.ndjson');
+      await invalid.writeAsString('$valid{"id":2,"name":["$privateValue"]}\n');
+      await expectLater(
+        importNdjson(
+          sourcePath: invalid.path,
+          databasePath: target,
+          jobId: 'invalid',
+          table: 'inventory',
+          columns: const {'id': 'id', 'name': 'name'},
+        ),
+        throwsA(
+          isA<NdjsonImportException>()
+              .having(
+                (e) => e.code,
+                'code',
+                NdjsonImportErrorCode.unsupportedValue,
+              )
+              .having((e) => e.line, 'line', 2)
+              .having((e) => e.byteOffset, 'offset', valid.length)
+              .having(
+                (e) => e.toString(),
+                'redacted',
+                allOf(
+                  isNot(contains(privateValue)),
+                  isNot(contains(directory.path)),
+                ),
+              ),
+        ),
+      );
+      final afterFailure = sqlite3.open(target);
+      try {
+        expect(
+          afterFailure
+              .select('SELECT count(*) AS n FROM inventory')
+              .single['n'],
+          501,
+        );
+        expect(
+          afterFailure
+              .select(
+                "SELECT rows_committed FROM ndjson_import_jobs WHERE job_id = 'invalid'",
+              )
+              .single['rows_committed'],
+          0,
+        );
+      } finally {
+        afterFailure.close();
+      }
+    } finally {
+      await directory.delete(recursive: true);
+    }
+  });
+}

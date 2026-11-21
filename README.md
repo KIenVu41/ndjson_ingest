@@ -2,7 +2,8 @@
 
 Import local NDJSON files into SQLite in a worker isolate, with bounded
 batches and atomic checkpoints for resuming after the process stops.
-Version 0.1.0 supports local file imports with the Dart VM on Linux and macOS.
+Import from Flutter Android/iOS applications or Dart VM applications on Linux
+and macOS.
 
 ## Installation
 
@@ -24,17 +25,97 @@ application schema.
 
 ## Supported environments
 
-| Environment | Support in 0.1.0 | Verification |
+| Environment | Support in 0.2.0 | Verification |
 | --- | --- | --- |
 | Dart VM on Linux | Supported | Ubuntu CI on Dart 3.10.0 and 3.13.4 |
 | Dart VM on macOS | Supported | Local macOS arm64 checks; macOS CI configured on Dart 3.13.4 |
 | Dart VM on Windows | Not yet declared supported | Not verified |
-| Flutter desktop, Android and iOS | Not yet declared supported | Application builds and device imports not verified |
+| Flutter Android | Supported | Emulator integration test and release APK build; mobile CI configured |
+| Flutter iOS | Supported | Simulator integration test and unsigned device release build; mobile CI configured |
+| Flutter desktop | Not yet declared supported | Flutter application builds not verified |
 | Web | Unsupported | Requires native file I/O, isolates and SQLite |
 
-The platform metadata declares only Linux and macOS. Flutter compatibility is
-not implied by Dart VM tests. Support for additional environments will be
-announced after application-level verification.
+The mobile verification baseline is **Flutter 3.47.5 / Dart 3.13.4**. Older
+Flutter toolchains have not been verified, even when their Dart SDK satisfies
+the package constraint. Mobile checks exercise the SQLite native build hook,
+worker isolate, Unicode input, resume, repeat imports and sanitized errors.
+The existing Dart SDK minimum remains 3.10.0.
+
+Local runtime checks passed on Android 16 / API 36, arm64 with 16 KiB pages,
+and an arm64 iOS 18.4 simulator. Release packaging is checked with an Android
+APK and an unsigned arm64 iOS application.
+
+Physical-device coverage and supported OS versions still depend on your app's
+Flutter toolchain and deployment target. Simulator/emulator tests do not cover
+all device architectures or operating-system versions.
+
+## Flutter mobile integration
+
+Add the package and SQLite to the application. This example also uses
+`path_provider` to resolve the application's persistent storage directory:
+
+```sh
+flutter pub add ndjson_ingest sqlite3 path_provider
+```
+
+Call after Flutter binding initialization, or from a running application:
+
+```dart
+import 'package:ndjson_ingest/ndjson_ingest.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:sqlite3/sqlite3.dart';
+
+Future<ImportProgress> importCatalog(String localNdjsonPath) async {
+  final directory = await getApplicationSupportDirectory();
+  final databasePath = '${directory.path}/catalog.sqlite';
+  final database = sqlite3.open(databasePath);
+  try {
+    database.execute(
+      'CREATE TABLE IF NOT EXISTS products '
+      '(id INTEGER PRIMARY KEY, name TEXT NOT NULL)',
+    );
+  } finally {
+    database.close();
+  }
+  return importNdjson(
+    sourcePath: localNdjsonPath,
+    databasePath: databasePath,
+    jobId: 'catalog-v1',
+    table: 'products',
+    columns: const {'id': 'id', 'name': 'name'},
+  );
+}
+```
+
+Resolve storage paths in the main isolate and pass file paths to the importer.
+`localNdjsonPath` must name an immutable local file accessible inside the app's
+sandbox. Copy selected documents, downloaded files or bundled assets into local
+storage first. Android `content://` URIs and asset keys are not filesystem
+paths. Keep the source in persistent storage while a job may need to resume.
+
+The worker isolate performs import work away from the UI isolate. Imports are
+foreground operations: mobile operating systems can suspend or terminate the
+app. Resume with the same job and unchanged source after reopening. A completed
+batch and its checkpoint are committed together; an uncommitted transaction is
+rolled back. Background execution, automatic retry and lifecycle scheduling
+remain the application's responsibility.
+
+### Run the mobile checks
+
+Boot a device first, then run from the repository:
+
+```sh
+FLUTTER_BIN=/path/to/flutter bash tool/check_mobile.sh android emulator-5554
+FLUTTER_BIN=/path/to/flutter bash tool/check_mobile.sh ios <simulator-uuid>
+```
+
+The harness generates a Flutter app in a temporary directory, depends on this
+checkout, runs the integration test, and checks release packaging. Android also
+builds a release APK; iOS uses a simulator test and an unsigned device
+release build. It uninstalls the test app and removes its project, build output
+and synthetic databases on exit, including failures. It leaves shared Flutter,
+Gradle and package caches intact. The `.dart.txt` fixture is copied into the
+Flutter app so the Dart-only package does not need Flutter test dependencies.
 
 ## Development
 
@@ -52,7 +133,8 @@ The SQLite check opens an in-memory database using the native library supplied
 by the SQLite build hook. It prints the engine version and verifies a bound
 insert and read. GitHub Actions runs the test suite on Ubuntu for both SDKs
 and has a separate macOS job. Ubuntu check names are unchanged for existing
-branch protection rules.
+branch protection rules. Android and iOS jobs use the same temporary-app
+harness described below.
 
 ## CLI example in the repository
 
