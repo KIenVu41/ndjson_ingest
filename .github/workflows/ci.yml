@@ -35,6 +35,27 @@ jobs:
       - run: dart analyze
       - run: dart test --reporter expanded
 
+      - name: Validate release archive
+        if: matrix.sdk == '3.13.4'
+        run: dart pub publish --dry-run
+
       - name: Run the resume example
         if: matrix.sdk == '3.13.4'
         run: dart run example/ndjson_ingest_example.dart
+
+  macos:
+    name: macOS Dart SDK (3.13.4)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.13.4'
+
+      - run: dart pub get
+      - run: dart analyze
+      - run: dart test --reporter expanded
+      - run: dart run example/ndjson_ingest_example.dart

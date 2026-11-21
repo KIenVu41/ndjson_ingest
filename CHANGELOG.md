@@ -1,3 +1,12 @@
+## 0.1.0
+
+- First stable release for Dart VM imports on Linux and macOS.
+- Retain the import API and checkpoint format from 0.1.0-dev.2.
+- Document installation, SDK requirements and verified platform scope.
+- Include a complete table-creation, pause/resume and cleanup example.
+- Add macOS CI alongside the existing Ubuntu SDK checks.
+- Flutter applications, Windows and web are outside this release's support scope.
+
 ## 0.1.0-dev.2
 
 - Configure transaction row count, source byte limit, and line byte limit.
