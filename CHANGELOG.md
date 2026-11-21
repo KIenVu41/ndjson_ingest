@@ -1,3 +1,14 @@
+## 0.2.0
+
+- Declare Flutter Android and iOS support using the existing import API.
+- Add mobile integration tests for native SQLite, Unicode input, pause/resume,
+  repeat imports, rollback and sanitized error positions.
+- Check Android emulator execution/release APKs and iOS simulator/device release builds.
+- Add Android and iOS CI jobs on Flutter 3.47.5.
+- Document sandbox paths, persistent source storage and foreground lifecycle limits.
+- Clean up generated Flutter test projects and test applications after checks.
+- Keep runtime dependencies, Dart SDK minimum and checkpoint format unchanged.
+
 ## 0.1.0
 
 - First stable release for Dart VM imports on Linux and macOS.
