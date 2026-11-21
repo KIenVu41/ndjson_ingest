@@ -2,25 +2,59 @@
 
 Import local NDJSON files into SQLite in a worker isolate, with bounded
 batches and atomic checkpoints for resuming after the process stops.
-This package is an early prerelease for native Dart and Flutter applications.
+Version 0.1.0 supports local file imports with the Dart VM on Linux and macOS.
+
+## Installation
+
+Requires Dart **3.10.0 or later in the 3.x series**.
+
+```sh
+dart pub add ndjson_ingest
+```
+
+To use the SQLite table-creation code below, also add its direct dependency:
+
+```sh
+dart pub add sqlite3
+```
+
+The package uses `sqlite3` native build hooks to supply SQLite. The destination
+file and table must exist before importing. The library does not create your
+application schema.
+
+## Supported environments
+
+| Environment | Support in 0.1.0 | Verification |
+| --- | --- | --- |
+| Dart VM on Linux | Supported | Ubuntu CI on Dart 3.10.0 and 3.13.4 |
+| Dart VM on macOS | Supported | Local macOS arm64 checks; macOS CI configured on Dart 3.13.4 |
+| Dart VM on Windows | Not yet declared supported | Not verified |
+| Flutter desktop, Android and iOS | Not yet declared supported | Application builds and device imports not verified |
+| Web | Unsupported | Requires native file I/O, isolates and SQLite |
+
+The platform metadata declares only Linux and macOS. Flutter compatibility is
+not implied by Dart VM tests. Support for additional environments will be
+announced after application-level verification.
 
 ## Development
 
-Use Dart 3.13.4, available via the pinned Flutter 3.47.5 SDK in FVM.
-The minimum is Dart 3.10.0. The native SQLite build and import tests have been
-verified on macOS arm64 and Ubuntu. The importer uses native Dart I/O.
+The repository pins Flutter 3.47.5 through FVM to provide Dart 3.13.4 for
+maintainers. This FVM version is not a requirement for package consumers.
 
 ```sh
 fvm dart pub get
 fvm dart analyze
+fvm dart test
 fvm dart run tool/check_sqlite.dart
 ```
 
 The SQLite check opens an in-memory database using the native library supplied
 by the SQLite build hook. It prints the engine version and verifies a bound
-insert and read.
+insert and read. GitHub Actions runs the test suite on Ubuntu for both SDKs
+and has a separate macOS job. Ubuntu check names are unchanged for existing
+branch protection rules.
 
-## Import prototype
+## CLI example in the repository
 
 The CLI accepts UTF-8 NDJSON objects with an integer `id` and a string
 `name`. It writes them to the `products` table of a dedicated SQLite
@@ -38,7 +72,7 @@ reached the end. Keep the source immutable during import. Each run streams a
 SHA-256 hash of the entire source before it resumes. This uses bounded memory
 but requires an O(file size) read even when the checkpoint is near the end.
 
-Every line needs an LF or CRLF ending. The prototype rejects blank lines and
+Every line needs an LF or CRLF ending. The importer rejects blank lines and
 limits a line to 256 KiB and a batch to 500 rows or 4 MiB of source bytes,
 whichever comes first. A single worker isolate commits rows and the checkpoint
 in one transaction. Duplicate IDs or an interrupted transaction roll back the
@@ -46,27 +80,67 @@ current batch. Earlier committed batches remain available.
 
 ## Import into your own table
 
-Create the destination table before calling the API. The following mapping
-imports `{"sku":"A-01","title":"Cà phê","active":true}` into an existing
-`inventory(item_id, label, enabled)` table.
+This complete example creates a temporary source file and database, creates
+the destination table, imports one batch, then resumes the remaining rows.
+It deletes the temporary files in `finally`, including when an import fails.
+For production, use persistent application paths and keep the source immutable.
 
 ```dart
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:ndjson_ingest/ndjson_ingest.dart';
+import 'package:sqlite3/sqlite3.dart';
 
 Future<void> main() async {
-  final progress = await importNdjson(
-    sourcePath: 'inventory.ndjson',
-    databasePath: 'app.sqlite',
-    jobId: 'inventory-v1',
-    table: 'inventory',
-    columns: const {'sku': 'item_id', 'title': 'label', 'active': 'enabled'},
-    batchRows: 500,
-    maxBatchBytes: 4 * 1024 * 1024,
-    maxLineBytes: 256 * 1024,
-  );
-  print(progress.rows);
+  final directory = await Directory.systemTemp.createTemp('ndjson-example-');
+  try {
+    final source = File('${directory.path}/inventory.ndjson');
+    final databasePath = '${directory.path}/inventory.sqlite';
+    final rows = List.generate(
+      501,
+      (index) => jsonEncode({'sku': 'SKU-$index', 'title': 'Item $index'}),
+    );
+    await source.writeAsString('${rows.join('\n')}\n');
+
+    final database = sqlite3.open(databasePath);
+    try {
+      database.execute('''
+        CREATE TABLE inventory (
+          item_id TEXT PRIMARY KEY NOT NULL,
+          label TEXT NOT NULL
+        )
+      ''');
+    } finally {
+      database.close();
+    }
+
+    Future<ImportProgress> runImport({int? maxBatches}) => importNdjson(
+      sourcePath: source.path,
+      databasePath: databasePath,
+      jobId: 'inventory-v1',
+      table: 'inventory',
+      columns: const {'sku': 'item_id', 'title': 'label'},
+      maxBatches: maxBatches,
+    );
+
+    final paused = await runImport(maxBatches: 1);
+    print('Paused after ${paused.rows} committed rows.');
+
+    final resumed = await runImport();
+    print(
+      'Finished with ${resumed.rows} rows (complete: ${resumed.complete}).',
+    );
+  } finally {
+    await directory.delete(recursive: true);
+  }
 }
 ```
+
+The output reports 500 committed rows, followed by 501 total rows. The
+[runnable example](example/ndjson_ingest_example.dart) contains the same code.
+From a repository checkout, run it with
+`fvm dart run example/ndjson_ingest_example.dart`.
 
 Each mapped key must be present. Supported values are strings, numbers,
 booleans and null. Booleans bind as SQLite integers, and the destination table
@@ -77,6 +151,10 @@ Resume requires the same source content, target table, mapping and
 change alters what the same mapping means. An incompatible job requires a
 new job ID. Existing rows remain in the destination, so the application
 must decide how to handle them before importing again.
+
+The defaults are `batchRows: 500`, `maxBatchBytes: 4 * 1024 * 1024`, and
+`maxLineBytes: 256 * 1024`. Pass these named arguments to `importNdjson` to
+override them. `maxBatches: 1` pauses after one committed batch.
 
 All three limits must be positive. `maxLineBytes` counts the UTF-8 bytes before
 LF, including CR for CRLF. `maxBatchBytes` includes line endings and limits
@@ -92,12 +170,8 @@ values, file paths, and the original database or OS error message.
 
 Run the recovery and concurrency tests with `fvm dart test`.
 
-The [runnable example](example/ndjson_ingest_example.dart) creates a temporary
-inventory database, pauses after one batch, resumes the same job, and cleans
-up its files. Run it with `fvm dart run example/ndjson_ingest_example.dart`.
-
 Use `error.code` to handle failures without parsing error messages. NDJSON
-validation errors now use `NdjsonImportException` rather than `FormatException`.
+validation errors use `NdjsonImportException`.
 
 ```dart
 try {
