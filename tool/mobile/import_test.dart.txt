@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
@@ -33,6 +34,8 @@ void main() {
         database.close();
       }
 
+      final snapshots = <ImportProgress>[];
+      final caller = Isolate.current.controlPort;
       Future<ImportProgress> run({int? maxBatches}) => importNdjson(
         sourcePath: source.path,
         databasePath: target,
@@ -40,15 +43,39 @@ void main() {
         table: 'inventory',
         columns: const {'id': 'id', 'name': 'name'},
         maxBatches: maxBatches,
+        onProgress: (progress) {
+          expect(Isolate.current.controlPort, caller);
+          snapshots.add(progress);
+        },
       );
-      expect((await run(maxBatches: 1)).rows, 500);
+      final paused = await run(maxBatches: 1);
+      expect(paused.rows, 500);
+      expect(snapshots.first, (rows: 0, offset: 0, complete: false));
+      expect(snapshots.last, paused);
+      snapshots.clear();
       final complete = await run();
       expect(complete, (
         rows: 501,
         offset: await source.length(),
         complete: true,
       ));
+      expect(snapshots.first, paused);
+      expect(snapshots.last, complete);
+      snapshots.clear();
       expect(await run(), complete);
+      expect(snapshots, [complete]);
+      final observerFailure = StateError('Mobile observer failed');
+      await expectLater(
+        importNdjson(
+          sourcePath: source.path,
+          databasePath: target,
+          jobId: 'mobile',
+          table: 'inventory',
+          columns: const {'id': 'id', 'name': 'name'},
+          onProgress: (_) => throw observerFailure,
+        ),
+        throwsA(same(observerFailure)),
+      );
       final verify = sqlite3.open(target);
       try {
         final rows = verify.select(
@@ -67,11 +94,13 @@ void main() {
       const privateValue = 'SYNTHETIC_PRIVATE_MOBILE_VALUE';
       final invalid = File('${directory.path}/invalid.ndjson');
       await invalid.writeAsString('$valid{"id":2,"name":["$privateValue"]}\n');
+      final failedSnapshots = <ImportProgress>[];
       await expectLater(
         importNdjson(
           sourcePath: invalid.path,
           databasePath: target,
           jobId: 'invalid',
+          onProgress: failedSnapshots.add,
           table: 'inventory',
           columns: const {'id': 'id', 'name': 'name'},
         ),
@@ -94,6 +123,7 @@ void main() {
               ),
         ),
       );
+      expect(failedSnapshots.last, (rows: 0, offset: 0, complete: false));
       final afterFailure = sqlite3.open(target);
       try {
         expect(
