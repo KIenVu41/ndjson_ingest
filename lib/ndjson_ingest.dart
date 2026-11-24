@@ -82,6 +82,16 @@ final class NdjsonImportException implements Exception {
 /// [maxLineBytes] counts bytes before LF, including CR for CRLF.
 /// These limits may change when resuming without changing the mapping.
 ///
+/// [onProgress] receives committed snapshots in the calling isolate after source
+/// verification, at most once per 100 ms during import, and at the end. Initial
+/// and final updates bypass throttling. Intermediate batches may be omitted.
+/// The last snapshot matches the result on success, including [maxBatches] pauses.
+/// Callbacks are synchronous; returned futures are not awaited. If a callback
+/// throws, further callbacks stop while the worker finishes and closes SQLite.
+/// Its first error is then rethrown unless the worker itself failed, in which
+/// case the worker error takes precedence. Callback errors do not cancel or
+/// roll back the import. No callbacks occur after the returned future completes.
+///
 /// NDJSON, SQLite and file I/O failures are reported as [NdjsonImportException].
 Future<ImportProgress> importNdjson({
   required String sourcePath,
@@ -94,6 +104,7 @@ Future<ImportProgress> importNdjson({
   int batchRows = _batchRows,
   int maxBatchBytes = _maxBatchBytes,
   int maxLineBytes = _maxLineBytes,
+  void Function(ImportProgress progress)? onProgress,
 }) {
   if (batchRows < 1 || maxBatchBytes < 1 || maxLineBytes < 1) {
     throw ArgumentError('Batch and line limits must be positive.');
@@ -118,33 +129,108 @@ Future<ImportProgress> importNdjson({
   if (tableName == 'ndjson_import_jobs' || tableName.startsWith('sqlite_')) {
     throw ArgumentError('The destination table name is reserved.');
   }
-  return Isolate.run(() async {
+  return _observeImport(
+    onProgress,
+    (port) => _startImport(
+      sourcePath,
+      databasePath,
+      jobId,
+      table,
+      mapping,
+      mappingVersion,
+      maxBatches,
+      batchRows,
+      maxBatchBytes,
+      maxLineBytes,
+      port,
+    ),
+  );
+}
+
+Future<ImportProgress> _observeImport(
+  void Function(ImportProgress)? onProgress,
+  Future<ImportProgress> Function(SendPort?) start,
+) async {
+  if (onProgress == null) return start(null);
+  final port = ReceivePort();
+  Object? callbackError;
+  StackTrace? callbackStack;
+  final subscription = port.listen((message) {
+    if (message is SendPort) {
+      message.send(null);
+      return;
+    }
+    if (callbackError != null) return;
     try {
-      return await _import(
-        sourcePath,
-        databasePath,
-        jobId,
-        table,
-        mapping,
-        mappingVersion,
-        maxBatches,
-        batchRows,
-        maxBatchBytes,
-        maxLineBytes,
-      );
-    } on SqliteException catch (error) {
-      throw NdjsonImportException._(
-        code: NdjsonImportErrorCode.sqlite,
-        sqliteCode: error.extendedResultCode,
-      );
-    } on FileSystemException catch (error) {
-      throw NdjsonImportException._(
-        code: NdjsonImportErrorCode.io,
-        osErrorCode: error.osError?.errorCode,
-      );
+      onProgress(message as ImportProgress);
+    } catch (error, stack) {
+      callbackError = error;
+      callbackStack = stack;
     }
   });
+  try {
+    final result = await start(port.sendPort);
+    if (callbackError != null) {
+      Error.throwWithStackTrace(callbackError!, callbackStack!);
+    }
+    return result;
+  } finally {
+    port.close();
+    await subscription.cancel();
+  }
 }
+
+// Keep the isolate closure outside the caller's scope, which holds the callback.
+Future<ImportProgress> _startImport(
+  String sourcePath,
+  String databasePath,
+  String jobId,
+  String table,
+  Map<String, String> columns,
+  String mappingVersion,
+  int? maxBatches,
+  int batchRows,
+  int maxBatchBytes,
+  int maxLineBytes,
+  SendPort? progressPort,
+) => Isolate.run(() async {
+  try {
+    return await _import(
+      sourcePath,
+      databasePath,
+      jobId,
+      table,
+      columns,
+      mappingVersion,
+      maxBatches,
+      batchRows,
+      maxBatchBytes,
+      maxLineBytes,
+      progressPort,
+    );
+  } on SqliteException catch (error) {
+    throw NdjsonImportException._(
+      code: NdjsonImportErrorCode.sqlite,
+      sqliteCode: error.extendedResultCode,
+    );
+  } on FileSystemException catch (error) {
+    throw NdjsonImportException._(
+      code: NdjsonImportErrorCode.io,
+      osErrorCode: error.osError?.errorCode,
+    );
+  } finally {
+    if (progressPort != null) {
+      final acknowledged = ReceivePort();
+      try {
+        // Drain updates before the result arrives on Isolate.run's separate port.
+        progressPort.send(acknowledged.sendPort);
+        await acknowledged.first;
+      } finally {
+        acknowledged.close();
+      }
+    }
+  }
+});
 
 String _identifier(String name) {
   if (name.trim().isEmpty || name.contains(String.fromCharCode(0))) {
@@ -180,6 +266,7 @@ Future<ImportProgress> _import(
   int batchRows,
   int maxBatchBytes,
   int maxLineBytes,
+  SendPort? progressPort,
 ) async {
   final file = File(sourcePath);
   final size = await file.length();
@@ -211,6 +298,19 @@ Future<ImportProgress> _import(
       if (offset < 0 || offset > size || rows < 0) {
         throw StateError('Invalid import checkpoint.');
       }
+      final notifications = Stopwatch()..start();
+      ImportProgress? lastProgress;
+      void report({bool force = false}) {
+        if (progressPort == null) return;
+        final progress = (rows: rows, offset: offset, complete: offset == size);
+        if (progress == lastProgress) return;
+        if (!force && notifications.elapsedMilliseconds < 100) return;
+        progressPort.send(progress);
+        lastProgress = progress;
+        notifications.reset();
+      }
+
+      report(force: true);
       if (offset == size) return (rows: rows, offset: offset, complete: true);
 
       var batches = 0;
@@ -258,35 +358,40 @@ Future<ImportProgress> _import(
         offset = pendingOffset;
         batches++;
         batch.clear();
+        report();
       }
 
-      await for (final line in _readLines(
-        file,
-        offset,
-        rows + 1,
-        columns.keys,
-        maxLineBytes,
-      )) {
-        if (line.nextOffset - line.offset > maxBatchBytes) {
-          throw NdjsonImportException._(
-            code: NdjsonImportErrorCode.rowExceedsBatchLimit,
-            line: rows + batch.length + 1,
-            byteOffset: line.offset,
-          );
+      try {
+        await for (final line in _readLines(
+          file,
+          offset,
+          rows + 1,
+          columns.keys,
+          maxLineBytes,
+        )) {
+          if (line.nextOffset - line.offset > maxBatchBytes) {
+            throw NdjsonImportException._(
+              code: NdjsonImportErrorCode.rowExceedsBatchLimit,
+              line: rows + batch.length + 1,
+              byteOffset: line.offset,
+            );
+          }
+          if (batch.isNotEmpty && line.nextOffset - offset > maxBatchBytes) {
+            commit();
+            if (batches == maxBatches) break;
+          }
+          batch.add(line);
+          pendingOffset = line.nextOffset;
+          if (batch.length == batchRows) {
+            commit();
+            if (batches == maxBatches) break;
+          }
         }
-        if (batch.isNotEmpty && line.nextOffset - offset > maxBatchBytes) {
-          commit();
-          if (batches == maxBatches) break;
-        }
-        batch.add(line);
-        pendingOffset = line.nextOffset;
-        if (batch.length == batchRows) {
-          commit();
-          if (batches == maxBatches) break;
-        }
+        if (batch.isNotEmpty) commit();
+        return (rows: rows, offset: offset, complete: offset == size);
+      } finally {
+        report(force: true);
       }
-      if (batch.isNotEmpty) commit();
-      return (rows: rows, offset: offset, complete: offset == size);
     } finally {
       insert.close();
     }

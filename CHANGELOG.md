@@ -1,3 +1,16 @@
+## 0.3.0
+
+- Add optional `onProgress` snapshots in the calling isolate after verification,
+  during committed batches and at completion or import failure.
+- Throttle intermediate notifications to one per 100 ms without dropping the
+  final committed snapshot, including paused, empty and completed jobs.
+- Drain notifications before completing the returned future.
+- Finish and clean up the worker before rethrowing a synchronous callback error;
+  worker failures take precedence. Callback errors do not cancel imports.
+- Add progress, rollback, resume and callback isolation/error regression tests.
+- Extend the mobile integration fixture and runnable example with progress.
+- Keep runtime dependencies, SDK minimum and checkpoint format unchanged.
+
 ## 0.2.0
 
 - Declare Flutter Android and iOS support using the existing import API.

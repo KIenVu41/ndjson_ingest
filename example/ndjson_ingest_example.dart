@@ -34,6 +34,9 @@ Future<void> main() async {
       table: 'inventory',
       columns: const {'sku': 'item_id', 'title': 'label'},
       maxBatches: maxBatches,
+      onProgress: (progress) {
+        print('Committed ${progress.rows} rows at byte ${progress.offset}.');
+      },
     );
 
     final paused = await runImport(maxBatches: 1);

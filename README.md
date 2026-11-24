@@ -25,7 +25,7 @@ application schema.
 
 ## Supported environments
 
-| Environment | Support in 0.2.0 | Verification |
+| Environment | Support in 0.3.0 | Verification |
 | --- | --- | --- |
 | Dart VM on Linux | Supported | Ubuntu CI on Dart 3.10.0 and 3.13.4 |
 | Dart VM on macOS | Supported | Local macOS arm64 checks; macOS CI configured on Dart 3.13.4 |
@@ -204,6 +204,9 @@ Future<void> main() async {
       table: 'inventory',
       columns: const {'sku': 'item_id', 'title': 'label'},
       maxBatches: maxBatches,
+      onProgress: (progress) {
+        print('Committed ${progress.rows} rows at byte ${progress.offset}.');
+      },
     );
 
     final paused = await runImport(maxBatches: 1);
@@ -244,6 +247,57 @@ source bytes, not decoded object memory or SQLite's total memory usage. A
 single row larger than this limit fails with `rowExceedsBatchLimit`. You may
 change these limits when resuming. An error discards the pending batch while
 preserving previously committed batches and their checkpoint.
+
+## Progress notifications
+
+Pass a synchronous `onProgress` callback to observe committed snapshots in the
+calling isolate. Existing calls without the callback keep their behavior.
+For Flutter, update UI state here after checking that the widget is mounted.
+
+```dart
+final totalBytes = await File(sourcePath).length();
+final result = await importNdjson(
+  sourcePath: sourcePath,
+  databasePath: databasePath,
+  jobId: 'catalog-v1',
+  table: 'products',
+  columns: const {'id': 'id', 'name': 'name'},
+  onProgress: (progress) {
+    final percent = totalBytes == 0 ? 100 : progress.offset * 100 / totalBytes;
+    print('${progress.rows} committed rows, ${percent.toStringAsFixed(1)}%');
+  },
+);
+```
+
+The first snapshot is emitted after source hashing and checkpoint verification.
+It contains the saved progress when resuming, or zero for a new job. Empty files
+and already completed jobs emit one completed snapshot. Errors before checkpoint
+verification emit no snapshots.
+
+During import, notifications are limited to one per 100 ms. Initial and final
+notifications bypass that limit, and identical snapshots are not repeated.
+Not every batch produces a notification. Snapshots contain only committed row
+counts, byte offsets and completion state; the live database may have advanced
+by the time the callback receives one. On success, the final snapshot matches
+the returned result, including a `maxBatches` pause with `complete: false`.
+On an import failure, a final snapshot retains the last committed boundary.
+There are no callbacks after the returned future completes.
+
+The callback runs synchronously in the caller, so UI state and non-sendable
+objects do not cross into the worker. Keep it short; returned futures are not
+awaited. If it throws, further callbacks stop while the import continues to its
+normal completion or failure and closes SQLite. The import future then rethrows
+the first callback error unchanged, unless the worker also failed: a worker
+error takes precedence. A callback error does not cancel or roll back committed
+data. Check the checkpoint or resume the job before assuming that no rows were
+written. Only import errors are sanitized; application callback errors are the
+application's responsibility.
+
+The percentage above measures committed source bytes, not elapsed time or hash
+progress. Show an indeterminate state while the full-file hash is running.
+Callbacks do not provide background execution or cancellation.
+
+## Import errors
 
 NDJSON, SQLite and file I/O failures surface as `NdjsonImportException`. The error
 provides a SQLite result code or OS error code when available. A rejected row
