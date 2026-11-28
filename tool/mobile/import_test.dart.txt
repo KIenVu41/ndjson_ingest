@@ -36,22 +36,42 @@ void main() {
 
       final snapshots = <ImportProgress>[];
       final caller = Isolate.current.controlPort;
-      Future<ImportProgress> run({int? maxBatches}) => importNdjson(
+      Future<ImportProgress> run({
+        int? maxBatches,
+        ImportCancellationToken? cancellationToken,
+      }) => importNdjson(
         sourcePath: source.path,
         databasePath: target,
         jobId: 'mobile',
         table: 'inventory',
         columns: const {'id': 'id', 'name': 'name'},
         maxBatches: maxBatches,
+        cancellationToken: cancellationToken,
         onProgress: (progress) {
           expect(Isolate.current.controlPort, caller);
           snapshots.add(progress);
+          if (cancellationToken != null && !progress.complete) {
+            cancellationToken.cancel();
+          }
         },
       );
       final paused = await run(maxBatches: 1);
       expect(paused.rows, 500);
       expect(snapshots.first, (rows: 0, offset: 0, complete: false));
       expect(snapshots.last, paused);
+      snapshots.clear();
+      final cancellation = ImportCancellationToken();
+      await expectLater(
+        run(cancellationToken: cancellation),
+        throwsA(
+          isA<NdjsonImportCancelled>().having(
+            (e) => e.progress,
+            'saved checkpoint',
+            paused,
+          ),
+        ),
+      );
+      expect(snapshots, [paused]);
       snapshots.clear();
       final complete = await run();
       expect(complete, (

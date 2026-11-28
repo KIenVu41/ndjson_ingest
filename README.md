@@ -25,7 +25,7 @@ application schema.
 
 ## Supported environments
 
-| Environment | Support in 0.3.0 | Verification |
+| Environment | Support in 0.4.0 | Verification |
 | --- | --- | --- |
 | Dart VM on Linux | Supported | Ubuntu CI on Dart 3.10.0 and 3.13.4 |
 | Dart VM on macOS | Supported | Local macOS arm64 checks; macOS CI configured on Dart 3.13.4 |
@@ -164,6 +164,7 @@ current batch. Earlier committed batches remain available.
 
 This complete example creates a temporary source file and database, creates
 the destination table, imports one batch, then resumes the remaining rows.
+It also demonstrates cancelling a resumed invocation at its saved checkpoint.
 It deletes the temporary files in `finally`, including when an import fails.
 For production, use persistent application paths and keep the source immutable.
 
@@ -197,20 +198,40 @@ Future<void> main() async {
       database.close();
     }
 
-    Future<ImportProgress> runImport({int? maxBatches}) => importNdjson(
+    Future<ImportProgress> runImport({
+      int? maxBatches,
+      ImportCancellationToken? cancellationToken,
+    }) => importNdjson(
       sourcePath: source.path,
       databasePath: databasePath,
       jobId: 'inventory-v1',
       table: 'inventory',
       columns: const {'sku': 'item_id', 'title': 'label'},
       maxBatches: maxBatches,
+      cancellationToken: cancellationToken,
       onProgress: (progress) {
         print('Committed ${progress.rows} rows at byte ${progress.offset}.');
+        if (cancellationToken != null && !progress.complete) {
+          // Simulate a stop request after the saved checkpoint is displayed.
+          cancellationToken.cancel();
+        }
       },
     );
 
     final paused = await runImport(maxBatches: 1);
     print('Paused after ${paused.rows} committed rows.');
+
+    final cancellation = ImportCancellationToken();
+    try {
+      await runImport(cancellationToken: cancellation);
+    } on NdjsonImportCancelled catch (stopped) {
+      final saved = stopped.progress;
+      print(
+        saved == null
+            ? 'Stopped before checkpoint verification.'
+            : 'Stopped after ${saved.rows} committed rows.',
+      );
+    }
 
     final resumed = await runImport();
     print(
@@ -295,7 +316,69 @@ application's responsibility.
 
 The percentage above measures committed source bytes, not elapsed time or hash
 progress. Show an indeterminate state while the full-file hash is running.
-Callbacks do not provide background execution or cancellation.
+Progress notifications alone do not provide background execution or cancellation.
+
+## Cooperative cancellation
+
+Create one `ImportCancellationToken` per import invocation and pass it through
+`cancellationToken`. Create and cancel it in the isolate calling the API.
+Call `cancel()` from a stop button or application lifecycle
+handler. Repeated requests, including after completion, are harmless. A token
+cannot be reused for another invocation, even after cancellation or failure.
+
+```dart
+final cancellation = ImportCancellationToken();
+final importing = importNdjson(
+  sourcePath: sourcePath,
+  databasePath: databasePath,
+  jobId: 'catalog-v1',
+  table: 'products',
+  columns: const {'id': 'id', 'name': 'name'},
+  cancellationToken: cancellation,
+);
+
+// From your stop button: cancellation.cancel();
+try {
+  final result = await importing;
+  print('Import complete: ${result.complete}');
+} on NdjsonImportCancelled catch (stopped) {
+  final saved = stopped.progress;
+  print(saved == null
+      ? 'Stopped before checkpoint verification.'
+      : 'Stopped at ${saved.rows} committed rows.');
+}
+```
+
+`cancel()` records a request; it does not wait for cleanup or interrupt native
+SQLite code. Await the import future before deleting files or replacing a job.
+Cancellation is checked before source I/O, between hash/read chunks, and around
+batch transactions. A running transaction finishes or rolls back first. Its
+outcome and checkpoint stay atomic. Pending rows not yet written are discarded.
+SQLite lock waits and long transactions can delay acknowledgment.
+
+An acknowledged stop throws `NdjsonImportCancelled` after resources are closed:
+
+- `progress == null` means the checkpoint was not yet verified. It does not mean
+  an existing job has zero committed rows. Hash-stage cancellation leaves the
+  database unchanged.
+- A non-null `progress` is the last verified, committed checkpoint. Its value
+  matches the last progress notification when the supplied callback has not thrown.
+- After EOF has been committed and verified, completion wins over a late stop
+  request. The invocation returns `complete: true`.
+- SQLite, I/O and validation errors already detected are preserved. Cancellation
+  does not replace those errors with a success or stop result.
+
+`maxBatches` remains a normal pause returning `complete: false` when no stop is
+acknowledged. Resume by calling `importNdjson` again with the same source,
+database, job and mapping, using a new token if needed. The source must remain
+immutable. No checkpoint schema migration is required.
+
+Progress callbacks still run in the calling isolate. They can explicitly call
+`cancel()`, but throwing from a callback alone does not request cancellation.
+A worker error or acknowledged cancellation takes precedence over a callback
+error. Notifications are drained before the future completes, including on
+cancellation. There are no background-execution or OS lifecycle guarantees;
+the application controls when to request a stop and when to resume.
 
 ## Import errors
 

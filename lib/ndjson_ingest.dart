@@ -13,6 +13,34 @@ const _batchRows = 500;
 /// The cumulative progress stored for an import job.
 typedef ImportProgress = ({int rows, int offset, bool complete});
 
+/// A cooperative cancellation request for one import invocation.
+///
+/// Create and cancel the token in the isolate that calls [importNdjson].
+final class ImportCancellationToken {
+  /// Creates an unused token. Create a new token for each import invocation.
+  ImportCancellationToken();
+
+  bool _used = false;
+  bool _cancelled = false;
+
+  /// Requests cancellation. Repeated calls are harmless.
+  ///
+  /// This does not wait for cleanup or interrupt a SQLite transaction. Await
+  /// the import future before deleting files or starting a replacement job.
+  void cancel() => _cancelled = true;
+}
+
+/// An import stopped cooperatively after releasing its resources.
+final class NdjsonImportCancelled implements Exception {
+  const NdjsonImportCancelled._([this.progress]);
+
+  /// The last verified, committed checkpoint, or null before verification.
+  final ImportProgress? progress;
+
+  @override
+  String toString() => 'NDJSON import cancelled.';
+}
+
 typedef _Line = ({List<Object?> values, int offset, int nextOffset});
 
 /// Stable categories for sanitized import failures.
@@ -92,6 +120,13 @@ final class NdjsonImportException implements Exception {
 /// case the worker error takes precedence. Callback errors do not cancel or
 /// roll back the import. No callbacks occur after the returned future completes.
 ///
+/// [cancellationToken] requests cooperative stopping while hashing, reading or
+/// between transactions. A running transaction finishes or rolls back first.
+/// Await the returned future before disposing resources. Cancellation throws
+/// [NdjsonImportCancelled] with the last verified checkpoint, or null before
+/// verification. An already committed EOF returns a completed result instead.
+/// Each token is single-use; callback errors alone still do not cancel imports.
+///
 /// NDJSON, SQLite and file I/O failures are reported as [NdjsonImportException].
 Future<ImportProgress> importNdjson({
   required String sourcePath,
@@ -105,6 +140,7 @@ Future<ImportProgress> importNdjson({
   int maxBatchBytes = _maxBatchBytes,
   int maxLineBytes = _maxLineBytes,
   void Function(ImportProgress progress)? onProgress,
+  ImportCancellationToken? cancellationToken,
 }) {
   if (batchRows < 1 || maxBatchBytes < 1 || maxLineBytes < 1) {
     throw ArgumentError('Batch and line limits must be positive.');
@@ -131,6 +167,7 @@ Future<ImportProgress> importNdjson({
   }
   return _observeImport(
     onProgress,
+    cancellationToken,
     (port) => _startImport(
       sourcePath,
       databasePath,
@@ -143,24 +180,38 @@ Future<ImportProgress> importNdjson({
       maxBatchBytes,
       maxLineBytes,
       port,
+      cancellationToken != null,
+      onProgress != null,
     ),
   );
 }
 
 Future<ImportProgress> _observeImport(
   void Function(ImportProgress)? onProgress,
+  ImportCancellationToken? cancellationToken,
   Future<ImportProgress> Function(SendPort?) start,
 ) async {
-  if (onProgress == null) return start(null);
+  if (cancellationToken != null) {
+    if (cancellationToken._used) {
+      throw StateError('A cancellation token can only be used once.');
+    }
+    cancellationToken._used = true;
+    if (cancellationToken._cancelled) throw const NdjsonImportCancelled._();
+  }
+  if (onProgress == null && cancellationToken == null) return start(null);
   final port = ReceivePort();
   Object? callbackError;
   StackTrace? callbackStack;
   final subscription = port.listen((message) {
+    if (message case (cancellationCheck: SendPort reply)) {
+      reply.send(cancellationToken!._cancelled);
+      return;
+    }
     if (message is SendPort) {
       message.send(null);
       return;
     }
-    if (callbackError != null) return;
+    if (callbackError != null || onProgress == null) return;
     try {
       onProgress(message as ImportProgress);
     } catch (error, stack) {
@@ -192,7 +243,9 @@ Future<ImportProgress> _startImport(
   int batchRows,
   int maxBatchBytes,
   int maxLineBytes,
-  SendPort? progressPort,
+  SendPort? coordinator,
+  bool cancellable,
+  bool reportProgress,
 ) => Isolate.run(() async {
   try {
     return await _import(
@@ -206,7 +259,8 @@ Future<ImportProgress> _startImport(
       batchRows,
       maxBatchBytes,
       maxLineBytes,
-      progressPort,
+      reportProgress ? coordinator : null,
+      cancellable ? coordinator : null,
     );
   } on SqliteException catch (error) {
     throw NdjsonImportException._(
@@ -219,11 +273,11 @@ Future<ImportProgress> _startImport(
       osErrorCode: error.osError?.errorCode,
     );
   } finally {
-    if (progressPort != null) {
+    if (coordinator != null) {
       final acknowledged = ReceivePort();
       try {
         // Drain updates before the result arrives on Isolate.run's separate port.
-        progressPort.send(acknowledged.sendPort);
+        coordinator.send(acknowledged.sendPort);
         await acknowledged.first;
       } finally {
         acknowledged.close();
@@ -267,14 +321,20 @@ Future<ImportProgress> _import(
   int maxBatchBytes,
   int maxLineBytes,
   SendPort? progressPort,
+  SendPort? cancellationPort,
 ) async {
+  if (cancellationPort != null) await _cancellationPoint(cancellationPort);
   final file = File(sourcePath);
   final size = await file.length();
   if (await File(databasePath).exists() &&
       await FileSystemEntity.identical(sourcePath, databasePath)) {
     throw StateError('The source and database must be different files.');
   }
-  final digest = (await sha256.bind(file.openRead()).single).toString();
+  final hashInput = cancellationPort == null
+      ? file.openRead()
+      : _cancellableHashInput(file, cancellationPort);
+  final digest = (await sha256.bind(hashInput).single).toString();
+  if (cancellationPort != null) await _cancellationPoint(cancellationPort);
   final mappingDigest = _mappingDigest(table, columns, mappingVersion);
   final database = sqlite3.open(databasePath, mode: OpenMode.readWrite);
   try {
@@ -313,11 +373,22 @@ Future<ImportProgress> _import(
       report(force: true);
       if (offset == size) return (rows: rows, offset: offset, complete: true);
 
+      Future<void> checkCancellation() async {
+        if (cancellationPort != null && offset != size) {
+          await _cancellationPoint(cancellationPort, (
+            rows: rows,
+            offset: offset,
+            complete: false,
+          ));
+        }
+      }
+
       var batches = 0;
       var pendingOffset = offset;
       final batch = <_Line>[];
 
-      void commit() {
+      Future<void> commit() async {
+        if (cancellationPort != null) await checkCancellation();
         database.execute('BEGIN IMMEDIATE');
         final nextRows = rows + batch.length;
         try {
@@ -359,6 +430,7 @@ Future<ImportProgress> _import(
         batches++;
         batch.clear();
         report();
+        if (cancellationPort != null) await checkCancellation();
       }
 
       try {
@@ -368,6 +440,7 @@ Future<ImportProgress> _import(
           rows + 1,
           columns.keys,
           maxLineBytes,
+          cancellationPort == null ? null : checkCancellation,
         )) {
           if (line.nextOffset - line.offset > maxBatchBytes) {
             throw NdjsonImportException._(
@@ -377,17 +450,17 @@ Future<ImportProgress> _import(
             );
           }
           if (batch.isNotEmpty && line.nextOffset - offset > maxBatchBytes) {
-            commit();
+            await commit();
             if (batches == maxBatches) break;
           }
           batch.add(line);
           pendingOffset = line.nextOffset;
           if (batch.length == batchRows) {
-            commit();
+            await commit();
             if (batches == maxBatches) break;
           }
         }
-        if (batch.isNotEmpty) commit();
+        if (batch.isNotEmpty) await commit();
         return (rows: rows, offset: offset, complete: offset == size);
       } finally {
         report(force: true);
@@ -454,10 +527,12 @@ Stream<_Line> _readLines(
   int lineNumber,
   Iterable<String> keys,
   int maxLineBytes,
+  Future<void> Function()? checkCancellation,
 ) async* {
   final line = BytesBuilder(copy: false);
   var lineStart = offset;
   await for (final chunk in file.openRead(offset)) {
+    if (checkCancellation != null) await checkCancellation();
     var start = 0;
     for (var end = 0; end < chunk.length; end++) {
       if (chunk[end] != 0x0a) continue;
@@ -482,12 +557,37 @@ Stream<_Line> _readLines(
       maxLineBytes,
     );
   }
+  if (checkCancellation != null) await checkCancellation();
   if (line.isNotEmpty) {
     throw NdjsonImportException._(
       code: NdjsonImportErrorCode.missingLineEnding,
       line: lineNumber,
       byteOffset: lineStart,
     );
+  }
+}
+
+Future<void> _cancellationPoint(
+  SendPort coordinator, [
+  ImportProgress? progress,
+]) async {
+  final reply = ReceivePort();
+  try {
+    // The same channel orders this check after preceding progress callbacks.
+    coordinator.send((cancellationCheck: reply.sendPort));
+    if (await reply.first as bool) throw NdjsonImportCancelled._(progress);
+  } finally {
+    reply.close();
+  }
+}
+
+Stream<List<int>> _cancellableHashInput(
+  File file,
+  SendPort coordinator,
+) async* {
+  await for (final chunk in file.openRead()) {
+    await _cancellationPoint(coordinator);
+    yield chunk;
   }
 }
 

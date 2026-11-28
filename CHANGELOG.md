@@ -1,3 +1,15 @@
+## 0.4.0
+
+- Add a single-use `ImportCancellationToken` for cooperative stopping.
+- Report `NdjsonImportCancelled` with a verified committed checkpoint, or null
+  when stopped before verification without changing the database.
+- Check cancellation between hash/read chunks and around batch transactions.
+- Finish or roll back a running transaction before acknowledging a stop; retain
+  detected worker errors and return success if EOF was already committed.
+- Keep progress draining and resource cleanup guarantees during cancellation.
+- Extend tests, the mobile fixture and the example with cancellation and resume.
+- Keep runtime dependencies, SDK minimum, result type and checkpoint format.
+
 ## 0.3.0
 
 - Add optional `onProgress` snapshots in the calling isolate after verification,

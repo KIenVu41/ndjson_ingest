@@ -27,20 +27,40 @@ Future<void> main() async {
       database.close();
     }
 
-    Future<ImportProgress> runImport({int? maxBatches}) => importNdjson(
+    Future<ImportProgress> runImport({
+      int? maxBatches,
+      ImportCancellationToken? cancellationToken,
+    }) => importNdjson(
       sourcePath: source.path,
       databasePath: databasePath,
       jobId: 'inventory-v1',
       table: 'inventory',
       columns: const {'sku': 'item_id', 'title': 'label'},
       maxBatches: maxBatches,
+      cancellationToken: cancellationToken,
       onProgress: (progress) {
         print('Committed ${progress.rows} rows at byte ${progress.offset}.');
+        if (cancellationToken != null && !progress.complete) {
+          // Simulate a stop request after the saved checkpoint is displayed.
+          cancellationToken.cancel();
+        }
       },
     );
 
     final paused = await runImport(maxBatches: 1);
     print('Paused after ${paused.rows} committed rows.');
+
+    final cancellation = ImportCancellationToken();
+    try {
+      await runImport(cancellationToken: cancellation);
+    } on NdjsonImportCancelled catch (stopped) {
+      final saved = stopped.progress;
+      print(
+        saved == null
+            ? 'Stopped before checkpoint verification.'
+            : 'Stopped after ${saved.rows} committed rows.',
+      );
+    }
 
     final resumed = await runImport();
     print(
